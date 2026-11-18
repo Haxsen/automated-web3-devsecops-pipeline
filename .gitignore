@@ -26,7 +26,6 @@ keystore/
 
 # Scanner output
 *.sarif
-checkov-results/
 mythril*.json
 slither*.json
 !contracts/slither.config.json

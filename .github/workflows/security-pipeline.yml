@@ -350,16 +350,18 @@ jobs:
 
       - name: Checkov (fails on any unsuppressed misconfiguration)
         working-directory: ${{ github.workspace }}
+        # With several --output formats, each --output-file-path entry is a FILE (with a single
+        # format it would be a directory). checkov.sarif is therefore the SARIF report itself.
         run: |
           docker run --rm -v "$PWD:/repo" -w /repo "$CHECKOV_IMAGE" \
-            --config-file .checkov.yaml --output cli --output sarif --output-file-path console,checkov-results
+            --config-file .checkov.yaml --output cli --output sarif --output-file-path console,checkov.sarif
 
       - name: Upload Checkov SARIF
-        if: always() && hashFiles('checkov-results/results_sarif.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        if: always() && hashFiles('checkov.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
-          sarif_file: checkov-results/results_sarif.sarif
+          sarif_file: checkov.sarif
           category: checkov
 
   # -----------------------------------------------------------------------------------------------

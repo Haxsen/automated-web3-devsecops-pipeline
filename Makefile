@@ -75,4 +75,4 @@ lock: ## Regenerate the hash-locked Slither requirements
 	  --python-version 3.12 --python-platform x86_64-unknown-linux-gnu -o requirements/slither.txt"
 
 clean: ## Remove build and scanner output
-	rm -rf contracts/out contracts/cache contracts/build contracts/lcov.info checkov-results *.sarif mythril.json
+	rm -rf contracts/out contracts/cache contracts/build contracts/lcov.info *.sarif mythril.json
