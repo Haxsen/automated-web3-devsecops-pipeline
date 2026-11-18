@@ -1,0 +1,10 @@
+# Security-critical paths require review from the code owner (enable "Require review from Code Owners"
+# in branch protection). Changing a gate, a policy or the deployer key's IAM is a security change.
+*                       @Haxsen
+/.github/               @Haxsen
+/infra/                 @Haxsen
+/policies/              @Haxsen
+/contracts/src/         @Haxsen
+/.gitleaks.toml         @Haxsen
+/.checkov.yaml          @Haxsen
+/contracts/slither.config.json @Haxsen

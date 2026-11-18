@@ -1,0 +1,74 @@
+# Gitleaks configuration: default ruleset + Web3-specific rules.
+# The default rules cover cloud/SaaS tokens; the rules below cover what actually drains protocols:
+# raw EVM private keys, seed phrases and authenticated RPC endpoints.
+# Rules are exercised on every run by scripts/secret_canary.sh, which generates fresh fake secrets.
+
+title = "web3-devsecops"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "evm-private-key"
+description = "EVM private key (32-byte hex) assigned to a key-like variable"
+regex = '''(?i)(?:private[_-]?key|priv[_-]?key|deployer[_-]?key|signer[_-]?key|wallet[_-]?key|eth[_-]?key|\bpk)[\w.\-"'\[\]]{0,20}\s*(?:=|:|=>|:=)\s*["'`]?((?:0x)?[a-f0-9]{64})\b'''
+secretGroup = 1
+entropy = 3.0
+keywords = ["key", "pk"]
+tags = ["web3", "private-key"]
+
+[[rules]]
+id = "evm-private-key-in-env-file"
+description = "32-byte hex value in a dotenv file (dotenv files must never be committed)"
+path = '''(?i)(?:^|/)\.env(?:\.[\w.-]+)?$'''
+regex = '''\b((?:0x)?[a-fA-F0-9]{64})\b'''
+secretGroup = 1
+entropy = 3.0
+tags = ["web3", "private-key"]
+
+[[rules]]
+id = "bip39-mnemonic"
+description = "BIP-39 seed phrase assigned to a mnemonic-like variable"
+regex = '''(?i)(?:mnemonic|seed[_-]?phrase|recovery[_-]?phrase|secret[_-]?phrase)[\w.\-"'\[\]]{0,20}\s*(?:=|:|=>|:=)\s*["'`]?((?:[a-z]{3,8} ){11,23}[a-z]{3,8})\b'''
+secretGroup = 1
+keywords = ["mnemonic", "seed", "phrase"]
+tags = ["web3", "mnemonic"]
+
+[[rules]]
+id = "infura-rpc-url"
+description = "Infura RPC URL with embedded project key"
+regex = '''https://[\w.-]*infura\.io/(?:v3|ws/v3)/([0-9a-f]{32})\b'''
+secretGroup = 1
+keywords = ["infura"]
+tags = ["web3", "rpc"]
+
+[[rules]]
+id = "alchemy-rpc-url"
+description = "Alchemy RPC URL with embedded API key"
+regex = '''https://[\w.-]+\.(?:g\.alchemy\.com|alchemyapi\.io)/v2/([A-Za-z0-9_-]{32})\b'''
+secretGroup = 1
+keywords = ["alchemy"]
+tags = ["web3", "rpc"]
+
+[[rules]]
+id = "quicknode-rpc-url"
+description = "QuickNode RPC URL with embedded token"
+regex = '''https://[\w-]+\.[\w-]+\.quiknode\.pro/([0-9a-f]{40})\b'''
+secretGroup = 1
+keywords = ["quiknode"]
+tags = ["web3", "rpc"]
+
+[[rules]]
+id = "block-explorer-api-key"
+description = "Etherscan-family block explorer API key"
+regex = '''(?i)(?:etherscan|bscscan|polygonscan|arbiscan|basescan|snowtrace)[\w.\-"'\[\]]{0,20}\s*(?:=|:|=>|:=)\s*["'`]?([A-Z0-9]{34})\b'''
+secretGroup = 1
+keywords = ["etherscan", "bscscan", "polygonscan", "arbiscan", "basescan", "snowtrace"]
+tags = ["web3", "api-key"]
+
+[[allowlists]]
+description = "Lockfiles hold integrity hashes, not secrets"
+paths = [
+  '''(?:^|/)\.terraform\.lock\.hcl$''',
+  '''(?:^|/)requirements/[\w.-]+\.txt$''',
+]

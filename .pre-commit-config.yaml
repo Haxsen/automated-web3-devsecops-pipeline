@@ -1,0 +1,23 @@
+# Shift-left: catch the cheapest problems before they ever reach CI.
+#   pipx install pre-commit && pre-commit install
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e # frozen: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: forge-fmt
+        name: forge fmt
+        entry: bash -c 'cd contracts && forge fmt --check'
+        language: system
+        files: ^contracts/.*\.sol$
+        pass_filenames: false
+
+      - id: terraform-fmt
+        name: terraform fmt
+        entry: terraform fmt -check -recursive infra/terraform
+        language: system
+        files: ^infra/terraform/.*\.tf$
+        pass_filenames: false

@@ -1,0 +1,416 @@
+# Security gauntlet for smart contracts and the infrastructure that deploys them.
+#
+#   pipeline-integrity  actionlint + zizmor        the pipeline secures itself first
+#   secrets             Gitleaks canary + TruffleHog + Gitleaks over full git history
+#   contracts           Foundry build, 10k-run fuzzing, stateful invariants, coverage gate
+#   slither             static analysis gate + scanner canary, SARIF to Code Scanning
+#   mythril             symbolic execution gate + scanner canary (matrix)
+#   iac                 terraform fmt/validate, TFLint, Checkov (SARIF)
+#   policy              OPA/Conftest Web3 guardrails + policy unit tests
+#   security-gate       single required status check for branch protection
+#
+# Hardening applied to this workflow: default-deny token permissions with per-job grants, every
+# action pinned to a full commit SHA, every container image pinned by digest, hash-locked Python
+# dependencies, no persisted git credentials, runner egress auditing, and no untrusted
+# `${{ }}` expansion inside shell scripts.
+
+name: Security Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly re-scan: scanners gain new detectors and secrets get leaked upstream even when code is unchanged.
+    - cron: "23 4 * * 1"
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  FOUNDRY_VERSION: v1.9.0
+  SOLC_VERSION: 0.8.28
+  TERRAFORM_VERSION: 1.17.2
+  TFLINT_VERSION: v0.66.0
+  # Scanner images: human-readable tag + immutable digest. Bump both together.
+  TRUFFLEHOG_IMAGE: trufflesecurity/trufflehog:3.99.9@sha256:2ec535840f860aa27f11fee20222fb790326ecd66325c96bd49d02ec6af46eca
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+  MYTHRIL_IMAGE: mythril/myth:0.24.8@sha256:49e11758e359d0b410f648df5bbcba28a52e091a78e4772b5c02b9043666b4ff
+  CHECKOV_IMAGE: bridgecrew/checkov:3.4.5@sha256:122602cf32cc72286155d39f1f234b7b594818f7b8d7fdf490701620e521368b
+  CONFTEST_IMAGE: openpolicyagent/conftest:v0.71.1@sha256:0e77cdf7c1fcde035f3c579e4aaa6664ee2a8be5777eaa9af9f520cdd02280c0
+  ACTIONLINT_IMAGE: rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+  ZIZMOR_IMAGE: ghcr.io/zizmorcore/zizmor:1.32.0@sha256:3014cc8f68f663935f69b3c3e0e41f5ce102b268d97db13db0f62208747f860d
+
+jobs:
+  # -----------------------------------------------------------------------------------------------
+  pipeline-integrity:
+    name: Pipeline integrity (actionlint + zizmor)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: actionlint (workflow correctness + shellcheck)
+        run: docker run --rm -v "$PWD:/repo:ro" -w /repo "$ACTIONLINT_IMAGE" -color
+
+      - name: zizmor (workflow security audit)
+        run: docker run --rm -v "$PWD:/repo:ro" -w /repo "$ZIZMOR_IMAGE" --format github --persona regular .github/workflows
+
+  # -----------------------------------------------------------------------------------------------
+  secrets:
+    name: Secret scanning (TruffleHog + Gitleaks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write # upload Gitleaks SARIF to Code Scanning
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Prove the scanner works before trusting a green result from it.
+      - name: Secret-scanner canary (fresh fake Web3 secrets must be detected)
+        run: bash scripts/secret_canary.sh "$GITLEAKS_IMAGE"
+
+      - name: TruffleHog (800+ detectors with live credential verification, full history)
+        run: |
+          docker run --rm -v "$PWD:/tmp/repo" -w /tmp/repo \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+            "$TRUFFLEHOG_IMAGE" git file:///tmp/repo \
+            --results=verified,unknown --fail --no-update --github-actions
+
+      - name: Gitleaks (Web3 rules - EVM keys, mnemonics, RPC URLs - full history)
+        id: gitleaks
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+            "$GITLEAKS_IMAGE" git /repo --config /repo/.gitleaks.toml --redact --no-banner \
+            --report-format sarif --report-path /repo/gitleaks.sarif
+
+      - name: Upload Gitleaks SARIF
+        if: always() && hashFiles('gitleaks.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+  # -----------------------------------------------------------------------------------------------
+  contracts:
+    name: Contracts (build, fuzz, invariants, coverage)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: contracts
+    env:
+      FOUNDRY_PROFILE: ci
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout (with pinned dependency submodules)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+          cache: false
+
+      - name: Formatting
+        run: forge fmt --check
+
+      - name: Build (fails if a contract exceeds the EIP-170 size limit)
+        run: forge build --sizes
+
+      - name: Unit, fuzz (10k runs) and invariant (256 x 128) tests
+        run: forge test
+
+      - name: Coverage
+        env:
+          FOUNDRY_PROFILE: default
+        run: forge coverage --no-match-coverage '(test|script|canary)' --report summary --report lcov
+
+      - name: Coverage gate (100% lines / 95% branches on src/)
+        run: python3 ../scripts/coverage_gate.py lcov.info --source-prefix src/ --min-lines 100 --min-branches 95
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-lcov
+          path: contracts/lcov.info
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # -----------------------------------------------------------------------------------------------
+  slither:
+    name: Static analysis (Slither)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write # upload Slither SARIF to Code Scanning
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout (with pinned dependency submodules)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+          cache: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Slither (hash-locked, no unpinned transitive deps)
+        run: python -m pip install --require-hashes --no-deps -r requirements/slither.txt
+
+      - name: Slither canary (known-vulnerable contract must be flagged)
+        run: |
+          solc-select install "$SOLC_VERSION"
+          slither contracts/canary/VulnerableVault.sol --compile-force-framework solc \
+            --solc-solcs-select "$SOLC_VERSION" --fail-none --json slither-canary.json
+          python scripts/slither_canary.py slither-canary.json \
+            --expect reentrancy-eth --expect tx-origin --expect arbitrary-send-eth
+
+      - name: Slither gate (fails on Low+; accepted risks are triaged inline with justification)
+        run: slither contracts --config-file contracts/slither.config.json --sarif slither.sarif
+
+      - name: Upload Slither SARIF
+        if: always() && hashFiles('slither.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: slither.sarif
+          category: slither
+
+  # -----------------------------------------------------------------------------------------------
+  mythril:
+    name: Symbolic execution (Mythril, ${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: SecureVault
+            source: src/SecureVault.sol
+            contract: SecureVault
+            mode: gate
+          - name: canary
+            source: canary/VulnerableVault.sol
+            contract: VulnerableVault
+            mode: canary
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout (with pinned dependency submodules)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+          cache: false
+
+      - name: Flatten target (resolves OpenZeppelin imports for Mythril)
+        working-directory: contracts
+        env:
+          SOURCE: ${{ matrix.source }}
+          CONTRACT: ${{ matrix.contract }}
+        run: forge flatten "$SOURCE" --output "build/$CONTRACT.flat.sol"
+
+      # Mythril's exit code is not a gate (0 on crash, 1 on any finding); mythril_gate.py reads the report.
+      # SOLC makes the image install the compiler via svm, which verifies its checksum.
+      - name: Run Mythril
+        env:
+          CONTRACT: ${{ matrix.contract }}
+        run: |
+          docker run --rm -e SOLC="$SOLC_VERSION" -v "$PWD/contracts:/src:ro" -w /src "$MYTHRIL_IMAGE" \
+            analyze "build/$CONTRACT.flat.sol:$CONTRACT" --solv "$SOLC_VERSION" \
+            --execution-timeout 600 --max-depth 128 -t 2 -o json > mythril.json || true
+
+      - name: Mythril gate (fail on Medium+)
+        if: matrix.mode == 'gate'
+        env:
+          CONTRACT: ${{ matrix.contract }}
+        run: python3 scripts/mythril_gate.py mythril.json --label "Mythril ($CONTRACT)" --fail-on medium
+
+      - name: Mythril canary (reentrancy + tx.origin must be found)
+        if: matrix.mode == 'canary'
+        run: python3 scripts/mythril_gate.py mythril.json --label "Mythril canary" --expect-swc 107 --expect-swc 115
+
+      - name: Upload Mythril report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mythril-${{ matrix.contract }}
+          path: mythril.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # -----------------------------------------------------------------------------------------------
+  iac:
+    name: Infrastructure as Code (Terraform, TFLint, Checkov)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write # upload Checkov SARIF to Code Scanning
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: terraform init (provider checksums must match the committed lockfile)
+        run: terraform init -backend=false -input=false -lockfile=readonly
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+      - name: Install TFLint
+        uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: TFLint (Terraform + AWS rulesets)
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids API rate limits when downloading signed plugins
+        run: |
+          tflint --init
+          tflint --format compact
+
+      - name: Checkov (fails on any unsuppressed misconfiguration)
+        working-directory: ${{ github.workspace }}
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo "$CHECKOV_IMAGE" \
+            --config-file .checkov.yaml --output cli --output sarif --output-file-path console,checkov-results
+
+      - name: Upload Checkov SARIF
+        if: always() && hashFiles('checkov-results/results_sarif.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: checkov-results/results_sarif.sarif
+          category: checkov
+
+  # -----------------------------------------------------------------------------------------------
+  policy:
+    name: Policy as code (OPA / Conftest)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Policy unit tests (every rule proven to fire and to stay quiet)
+        run: docker run --rm -v "$PWD:/project:ro" -w /project "$CONFTEST_IMAGE" verify --policy policies/terraform --show-builtin-errors
+
+      - name: Enforce Web3 guardrails on Terraform
+        run: |
+          docker run --rm -v "$PWD:/project:ro" -w /project --entrypoint sh "$CONFTEST_IMAGE" -c \
+            'conftest test --parser hcl2 --combine --all-namespaces --policy policies/terraform infra/terraform/*.tf'
+
+  # -----------------------------------------------------------------------------------------------
+  security-gate:
+    name: Security gate
+    if: always()
+    needs: [pipeline-integrity, secrets, contracts, slither, mythril, iac, policy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Evaluate stage results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          {
+            echo "## Security gate"
+            echo
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+            jq -r 'to_entries[] | "| \(.key) | \(if .value.result == "success" then "✅ success" else "❌ \(.value.result)" end) |"' <<<"$NEEDS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if jq -e 'to_entries | any(.value.result != "success")' <<<"$NEEDS" >/dev/null; then
+            echo "::error title=Security gate::One or more security stages did not pass. Merge and deploy are blocked."
+            exit 1
+          fi
+          echo "All security stages passed."

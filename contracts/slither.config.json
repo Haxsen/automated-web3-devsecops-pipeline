@@ -1,0 +1,8 @@
+{
+  "detectors_to_run": "all",
+  "filter_paths": "contracts/(lib|test|script|canary)/",
+  "exclude_dependencies": true,
+  "fail_on": "low",
+  "compile_force_framework": "foundry",
+  "foundry_compile_all": false
+}

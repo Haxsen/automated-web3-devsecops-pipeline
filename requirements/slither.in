@@ -1,0 +1,4 @@
+# Slither static analyser + solc-select (used by the scanner-canary job).
+# Lock with: make lock   (regenerates slither.txt with --generate-hashes)
+slither-analyzer==0.11.6
+solc-select

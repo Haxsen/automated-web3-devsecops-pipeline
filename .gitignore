@@ -1,0 +1,41 @@
+# Foundry
+contracts/out/
+contracts/cache/
+contracts/build/
+contracts/broadcast/
+contracts/crytic-export/
+contracts/lcov.info
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+terraform.tfvars
+*.auto.tfvars
+backend.hcl
+
+# Secrets: never committed (the secret scan will fail the build if one slips through)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+keystore/
+
+# Scanner output
+*.sarif
+checkov-results/
+mythril*.json
+slither*.json
+!contracts/slither.config.json
+
+# Tooling
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+
+# Personal notes
+*.local.md

@@ -1,0 +1,119 @@
+# Keyless, gated deployment.
+#
+#   1. Refuses to run unless the Security Pipeline passed for this exact commit on main.
+#   2. Runs in the `sepolia` GitHub Environment (configure required reviewers on it).
+#   3. Gets short-lived AWS credentials over OIDC. No AWS keys are stored in GitHub.
+#   4. Reads the authenticated RPC URL from Secrets Manager and masks it.
+#   5. Signs with the secp256k1 key in AWS KMS (`--aws`). The private key never leaves the HSM.
+#
+# Required environment variables on the `sepolia` environment (these are identifiers, not secrets):
+#   AWS_REGION, AWS_DEPLOY_ROLE_ARN, DEPLOYER_KMS_KEY_ARN, RPC_URL_SECRET_ARN,
+#   VAULT_ASSET, VAULT_ADMIN, VAULT_WITHDRAW_LIMIT
+# All of them except the VAULT_* values are Terraform outputs from infra/terraform.
+
+name: Deploy (KMS-signed)
+
+on:
+  workflow_dispatch:
+    inputs:
+      broadcast:
+        description: "Broadcast transactions (unchecked = simulation only)"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: deploy-sepolia
+  cancel-in-progress: false
+
+env:
+  FOUNDRY_VERSION: v1.9.0
+
+jobs:
+  require-green-pipeline:
+    name: Require green Security Pipeline for this commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read # query Security Pipeline runs for this commit
+    steps:
+      - name: Verify ref and security gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+        run: |
+          if [[ "$REF" != "refs/heads/main" ]]; then
+            echo "::error::Deployments are only allowed from main (got $REF)."
+            exit 1
+          fi
+          passed="$(gh api "repos/$REPO/actions/workflows/security-pipeline.yml/runs?head_sha=$SHA&status=success&per_page=1" --jq '.total_count')"
+          if [[ "$passed" -lt 1 ]]; then
+            echo "::error::No successful Security Pipeline run for $SHA. Deployment blocked."
+            exit 1
+          fi
+          echo "Security Pipeline passed for $SHA."
+
+  deploy:
+    name: Deploy SecureVault to Sepolia
+    needs: require-green-pipeline
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: sepolia
+    permissions:
+      contents: read
+      id-token: write # OIDC token for AWS STS; no long-lived cloud credentials exist
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout (with pinned dependency submodules)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+          cache: false
+
+      - name: Assume deploy role via OIDC
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+          role-duration-seconds: 900
+
+      - name: Deploy (signed inside AWS KMS)
+        working-directory: contracts
+        env:
+          AWS_KMS_KEY_ID: ${{ vars.DEPLOYER_KMS_KEY_ARN }}
+          RPC_URL_SECRET_ARN: ${{ vars.RPC_URL_SECRET_ARN }}
+          VAULT_ASSET: ${{ vars.VAULT_ASSET }}
+          VAULT_ADMIN: ${{ vars.VAULT_ADMIN }}
+          VAULT_WITHDRAW_LIMIT: ${{ vars.VAULT_WITHDRAW_LIMIT }}
+          BROADCAST: ${{ inputs.broadcast }}
+        run: |
+          set -euo pipefail
+
+          # The RPC URL embeds a provider API key: fetch it just-in-time, mask it, keep it in this step only.
+          rpc_url="$(aws secretsmanager get-secret-value --secret-id "$RPC_URL_SECRET_ARN" --query SecretString --output text)"
+          echo "::add-mask::$rpc_url"
+
+          deployer="$(cast wallet address --aws)"
+          echo "Deployer address (derived from the KMS public key): $deployer"
+
+          args=(script script/Deploy.s.sol:Deploy --rpc-url "$rpc_url" --aws --sender "$deployer")
+          if [[ "$BROADCAST" == "true" ]]; then
+            args+=(--broadcast --slow)
+          else
+            echo "Simulation only. Re-run with 'broadcast' checked to send transactions."
+          fi
+          forge "${args[@]}"

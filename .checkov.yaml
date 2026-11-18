@@ -1,0 +1,12 @@
+# Checkov configuration (https://www.checkov.io/2.Basics/CLI%20Command%20Reference.html)
+# Suppressions are NOT made here. Every accepted risk is an inline `#checkov:skip=<ID>:<justification>`
+# next to the resource it applies to, so the reason is reviewed with the code.
+directory:
+  - infra/terraform
+framework:
+  - terraform
+compact: true
+quiet: false
+download-external-modules: false
+soft-fail: false
+skip-download: true

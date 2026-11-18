@@ -1,0 +1,47 @@
+# Keep every pinned dependency current, without trusting brand-new releases.
+# `cooldown` waits a week before proposing a version: most malicious package releases are caught
+# and yanked within days, so this blunts compromised-maintainer supply-chain attacks.
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: gitsubmodule
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps(contracts)"
+
+  - package-ecosystem: terraform
+    directory: /infra/terraform
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps(infra)"
+
+  - package-ecosystem: pip
+    directory: /requirements
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      slither:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps(ci)"

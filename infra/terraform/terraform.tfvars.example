@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars (git-ignored) and fill in.
+project                     = "secure-vault"
+environment                 = "sepolia"
+aws_region                  = "eu-west-1"
+github_repository           = "your-github-user/automated-web3-devsecops-pipeline"
+create_github_oidc_provider = true
+key_admin_role_arns         = ["arn:aws:iam::123456789012:role/BreakGlassKeyAdmin"]
+security_alert_emails       = ["security@example.com"]
